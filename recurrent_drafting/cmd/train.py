@@ -25,16 +25,14 @@ Training arguments:
 https://github.com/huggingface/transformers/blob/main/src/transformers/training_args.py
 """
 
+import argparse
 import math
 import multiprocessing
-import pathlib
 from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
-import numpy as np
 import torch
-import torch.nn as nn
 import transformers
 from torch.utils.data import DataLoader
 
@@ -65,7 +63,6 @@ class TrainingArguments:
     learning_rate: float = 2e-5
     num_train_epochs: int = 3
     per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 1
     weight_decay: float = 0.01
     logging_steps: int = 50
     save_steps: int = 1000
@@ -94,12 +91,40 @@ def generate_drafter_config_from_base(llm, training_args):
     )
 
 
+def evaluate(redrafter, eval_loader, training_args):
+    redrafter.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad():
+        for batch in eval_loader:
+            for k in batch:
+                batch[k] = batch[k].to(training_args.device)
+            logits = redrafter(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                next_n=training_args.drafter_predict_n_tokens,
+            )
+            loss, _, _ = drafter_loss(
+                logits, batch["labels"], training_args.drafter_predict_n_tokens, training_args.drafter_top_k
+            )
+            total_loss += loss.item()
+            num_batches += 1
+    avg_loss = total_loss / max(1, num_batches)
+    print(f"[Eval] Average Loss: {avg_loss:.4f}")
+    redrafter.train()
+    return avg_loss
+
+
 def train(model_args, training_args):
     tokenizer = get_tokenizer(model_args, training_args)
     train_dataset = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train").map(
         lambda x: data.sharegpt_record_to_vicuna_training_instance(x, tokenizer),
         num_proc=multiprocessing.cpu_count(),
     )
+    eval_dataset = datasets.load_dataset("tatsu-lab/alpaca_eval", split="eval").map(
+        lambda x: data.sharegpt_record_to_vicuna_training_instance(x, tokenizer),
+        num_proc=1,
+    ).select(range(128))  # Use a small subset for eval
 
     config = transformers.AutoConfig.from_pretrained(model_args.llm_name_or_path)
     orig_ctx_len = getattr(config, "max_position_embeddings", None)
@@ -133,6 +158,12 @@ def train(model_args, training_args):
         shuffle=True,
         collate_fn=collate_fn,
     )
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=training_args.per_device_train_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
 
     optimizer = torch.optim.AdamW(
         redrafter.drafter.parameters(),
@@ -140,7 +171,6 @@ def train(model_args, training_args):
         weight_decay=training_args.weight_decay,
     )
 
-    num_training_steps = len(train_loader) * training_args.num_train_epochs // training_args.gradient_accumulation_steps
     global_step = 0
     redrafter.train()
     for epoch in range(training_args.num_train_epochs):
@@ -156,30 +186,25 @@ def train(model_args, training_args):
             loss, log, eval_log = drafter_loss(
                 logits, batch["labels"], training_args.drafter_predict_n_tokens, training_args.drafter_top_k
             )
-            loss = loss / training_args.gradient_accumulation_steps
+            epoch_loss += loss.item()  # accumulate batch loss
             loss.backward()
-            epoch_loss += loss.item()
-            if (step + 1) % training_args.gradient_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step += 1
-                if global_step % training_args.logging_steps == 0:
-                    print(f"Epoch {epoch+1} Step {global_step}: Loss {epoch_loss/(step+1):.4f}")
-                if global_step % training_args.save_steps == 0:
-                    drafter.save_pretrained(training_args.output_dir)
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+            if global_step % training_args.logging_steps == 0:
+                print(f"Epoch {epoch+1} Step {global_step}: Loss {epoch_loss/(step+1):.4f}")
+            if global_step % training_args.save_steps == 0:
+                drafter.save_pretrained(training_args.output_dir)
         print(f"Epoch {epoch+1} finished. Average Loss: {epoch_loss/(step+1):.4f}")
+
+        # Evaluate at the end of each epoch
+        evaluate(redrafter, eval_loader, training_args)
 
     drafter.save_pretrained(training_args.output_dir)
     print(f"Training complete. Drafter saved to {training_args.output_dir}")
 
 
-def eval(model_args, training_args):
-    print("Evaluation is not implemented in this explicit loop version.")
-
-
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--llm_name_or_path", type=str, default="lmsys/vicuna-7b-v1.3")
     parser.add_argument("--drafter_name_or_path", type=str, default=None)
@@ -187,7 +212,6 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_steps", type=int, default=1000)
@@ -214,9 +238,9 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
     train(model_args, training_args)
