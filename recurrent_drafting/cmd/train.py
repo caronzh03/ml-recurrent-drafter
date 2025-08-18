@@ -35,6 +35,7 @@ import datasets
 import torch
 import transformers
 from torch.utils.data import DataLoader
+import wandb
 
 from recurrent_drafting.configuration_drafter import DrafterConfig
 from recurrent_drafting.modeling_drafter import Drafter
@@ -111,20 +112,24 @@ def evaluate(redrafter, eval_loader, training_args):
             num_batches += 1
     avg_loss = total_loss / max(1, num_batches)
     print(f"[Eval] Average Loss: {avg_loss:.4f}")
+    wandb.log({"eval/loss": avg_loss})
     redrafter.train()
     return avg_loss
 
 
 def train(model_args, training_args):
     tokenizer = get_tokenizer(model_args, training_args)
+    tokenizer.pad_token = tokenizer.eos_token  # Set pad token to eos token for compatibility
     train_dataset = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train").map(
-        lambda x: data.sharegpt_record_to_vicuna_training_instance(x, tokenizer),
+        lambda x: data.sharegpt_record_to_qwen_training_instance(x, tokenizer),
         num_proc=multiprocessing.cpu_count(),
     )
-    eval_dataset = datasets.load_dataset("tatsu-lab/alpaca_eval", split="eval").map(
-        lambda x: data.sharegpt_record_to_vicuna_training_instance(x, tokenizer),
-        num_proc=1,
-    ).select(range(128))  # Use a small subset for eval
+    eval_dataset = datasets.load_dataset("tatsu-lab/alpaca_eval", split="eval") \
+        .map(data.convert_alpaca_to_sharegpt, num_proc=multiprocessing.cpu_count()) \
+        .map(
+            lambda x: data.sharegpt_record_to_qwen_training_instance(x, tokenizer),
+            num_proc=multiprocessing.cpu_count(),
+        ).select(range(128))  # Use a small subset for eval
 
     config = transformers.AutoConfig.from_pretrained(model_args.llm_name_or_path)
     orig_ctx_len = getattr(config, "max_position_embeddings", None)
@@ -186,6 +191,7 @@ def train(model_args, training_args):
             loss, log, eval_log = drafter_loss(
                 logits, batch["labels"], training_args.drafter_predict_n_tokens, training_args.drafter_top_k
             )
+            wandb.log(log)
             epoch_loss += loss.item()  # accumulate batch loss
             loss.backward()
             optimizer.step()
@@ -206,19 +212,19 @@ def train(model_args, training_args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--llm_name_or_path", type=str, default="lmsys/vicuna-7b-v1.3")
+    parser.add_argument("--llm_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--drafter_name_or_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--model_max_length", type=int, default=2048)
+    parser.add_argument("--model_max_length", type=int, default=512)
     parser.add_argument("--drafter_predict_n_tokens", type=int, default=5)
     parser.add_argument("--drafter_top_k", type=int, default=5)
-    parser.add_argument("--drafter_num_layers", type=int, default=1)
+    parser.add_argument("--drafter_num_layers", type=int, default=2)
     parser.add_argument("--rnn", action="store_true")
     parser.add_argument("--cache_dir", type=str, default=None)
     args = parser.parse_args()
@@ -243,4 +249,5 @@ if __name__ == "__main__":
         save_steps=args.save_steps,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+    wandb.init(project="redrafter", config={**vars(model_args), **vars(training_args)})
     train(model_args, training_args)
