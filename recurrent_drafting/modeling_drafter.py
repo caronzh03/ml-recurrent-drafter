@@ -33,7 +33,7 @@ def register_auto_models() -> None:
 class ResBlock(torch.nn.Module):
     def __init__(self, cfg: configuration_drafter.DrafterConfig):
         super().__init__()
-        self.linear = torch.nn.Linear(cfg.exit_dim, cfg.exit_dim, bias=True)
+        self.linear = torch.nn.Linear(cfg.exit_dim, cfg.exit_dim, bias=True, dtype=torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + torch.nn.functional.silu(self.linear(x))
@@ -117,12 +117,12 @@ class Drafter(transformers.PreTrainedModel):
         # Layer 2 is mandatory.
         self.lm_head = torch.nn.Sequential(
             *([ResBlock(cfg) for _ in range(cfg.num_draft_layers)]),  # residual blocks
-            torch.nn.Linear(in_features=cfg.exit_dim, out_features=cfg.vocab_size, bias=False),
+            torch.nn.Linear(in_features=cfg.exit_dim, out_features=cfg.vocab_size, bias=False, dtype=torch.bfloat16),
         )
 
         if cfg.rnn:
-            self.rnn_u = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True)
-            self.rnn_w = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
+            self.rnn_u = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True, dtype=torch.bfloat16)
+            self.rnn_w = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False, dtype=torch.bfloat16)
 
     def compute_logits(self, x: torch.Tensor) -> torch.Tensor:
         logits = maintain_logits(
